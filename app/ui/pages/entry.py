@@ -1,6 +1,3 @@
-# -*- coding: utf-8 -*-
-# app/ui/pages/entry.py
-
 import math
 import random
 import time
@@ -19,7 +16,7 @@ PRIMARY = "#ff3b3b"
 PAGE_CSS = f"""
 <style>
 .block-container {{ padding-top: 1rem; max-width: 1260px; }}
-/* Псевдо-модалка поверх интерфейса */
+
 .overlay {{
   position: fixed; inset: 0; background: rgba(0,0,0,.65);
   z-index: 9999; display: flex; align-items: center; justify-content: center;
@@ -56,8 +53,9 @@ def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
 
 def rr_targets(entry: float, stop: float, multiples=(1.0, 1.5, 2.0)):
     r = abs(entry - stop)
-    sign = 1 if entry < stop else -1  # если стоп ниже — long
-    return [entry + (-sign) * m * r for m in multiples]
+    long_side = entry < stop  # стоп выше => short, ниже => long
+    sign = 1 if long_side else -1
+    return [entry + sign * m * r for m in multiples]
 
 def color_levels(fig, y_values, labels, color, dash="dash", row=1, col=1):
     for y, label in zip(y_values, labels):
@@ -128,7 +126,7 @@ def get_klines(symbol: str, interval: str, limit: int) -> pd.DataFrame:
         try:
             return _binance_primary(symbol, interval, limit)
         except Exception:
-            time.sleep(0.6 + attempt*0.8 + random.random()*0.4)
+            time.sleep(0.6 + attempt*0.8)
     try:
         return _binance_mirror(symbol, interval, limit)
     except Exception:
@@ -205,7 +203,7 @@ def _render_fear_greed_modal():
 
 # ============================ PUBLIC ENTRY ============================
 def tab_entry():
-    """Главная вкладка «Расчёт входа». Ничего не исполняем на импорте, только при вызове."""
+    """Главная вкладка «Расчёт входа». Убраны «Новости» и «ИИ подсказка». Есть всплывающий график F&G."""
     st.markdown(PAGE_CSS, unsafe_allow_html=True)
 
     st.title("Вкладка 1 — Расчёт входа")
