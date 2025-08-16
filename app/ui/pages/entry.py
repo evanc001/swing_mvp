@@ -69,7 +69,14 @@ def tab_entry(journal: TradeJournal):
 
     st.markdown(f"**Предложенный риск:** {advice.percent:.1f}% ({advice.bracket}), причина: {advice.reason}")
 
-    risk_choice = st.segmented_control("Выбери риск", options=["Низкий (0.5–1%)","Средний (1–2%)","Высокий (2–3%)"], default="Средний (1–2%)")
+    risk_choice = st.radio(
+    "Выбери риск",
+    options=["Низкий (0.5–1%)", "Средний (1–2%)", "Высокий (2–3%)"],
+    index=1,
+    horizontal=True,
+    key="risk_choice"
+    )
+
     if risk_choice.startswith("Низкий"):
         risk_pct = 1.0
     elif risk_choice.startswith("Высокий"):
