@@ -1,6 +1,8 @@
-import math
-import random
+# -*- coding: utf-8 -*-
+# app/ui/pages/entry.py
+
 import time
+import random
 from datetime import datetime, timedelta, timezone
 
 import pandas as pd
@@ -16,7 +18,7 @@ PRIMARY = "#ff3b3b"
 PAGE_CSS = f"""
 <style>
 .block-container {{ padding-top: 1rem; max-width: 1260px; }}
-
+/* overlay modal */
 .overlay {{
   position: fixed; inset: 0; background: rgba(0,0,0,.65);
   z-index: 9999; display: flex; align-items: center; justify-content: center;
@@ -26,13 +28,7 @@ PAGE_CSS = f"""
   border: 1px solid #2b2f36; border-radius: 14px; padding: 14px 18px;
   box-shadow: 0 20px 50px rgba(0,0,0,.55);
 }}
-.modal-header {{
-  display:flex; align-items:center; justify-content:space-between; gap: 10px; margin-bottom: 6px;
-}}
-.btn-close {{
-  background: {PRIMARY}; color: #fff; border: none; padding: 6px 10px;
-  border-radius: 8px; cursor: pointer; font-weight: 600;
-}}
+.modal h3 {{ margin: 0 0 6px 0; }}
 .caption-note {{ font-size:12px; opacity:.75; margin-top:-6px; }}
 </style>
 """
@@ -45,25 +41,30 @@ def ema(series: pd.Series, period: int) -> pd.Series:
     return series.ewm(span=period, adjust=False).mean()
 
 def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    if df.empty:
+        return pd.Series(dtype="float64")
     high_low = df["high"] - df["low"]
     high_close = (df["high"] - df["close"].shift(1)).abs()
     low_close = (df["low"] - df["close"].shift(1)).abs()
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     return tr.rolling(period).mean()
 
-def rr_targets(entry: float, stop: float, multiples=(1.0, 1.5, 2.0)):
+def rr_targets(entry: float, stop: float, direction: str, multiples=(1.0, 1.5, 2.0)):
     r = abs(entry - stop)
-    long_side = entry < stop  # стоп выше => short, ниже => long
-    sign = 1 if long_side else -1
-    return [entry + sign * m * r for m in multiples]
+    if r == 0:
+        r = max(entry, 1) * 0.002  # страховой минимум, чтобы не делить на ноль
+    if direction == "long":
+        return [entry + m * r for m in multiples]
+    else:
+        return [entry - m * r for m in multiples]
 
-def color_levels(fig, y_values, labels, color, dash="dash", row=1, col=1):
+def add_levels(fig, y_values, labels, color, dash="dash", row=1, col=1):
     for y, label in zip(y_values, labels):
         fig.add_hline(y=y, line=dict(color=color, width=1.6, dash=dash),
                       annotation_text=label, annotation_position="right", row=row, col=col)
 
 # ============================ DATA FETCH (ROBUST) ============================
-BINANCE_HEADERS = {"User-Agent": "swing-mvp/1.0"}
+BINANCE_HEADERS = {"User-Agent": "swing-mvp/1.1"}
 
 def _klines_to_df(data):
     cols = ["open_time","open","high","low","close","volume","close_time","qav","trades","taker_base","taker_quote","ignore"]
@@ -71,7 +72,8 @@ def _klines_to_df(data):
     df["open_time"]  = df["open_time"].apply(to_datetime_utc)
     df["close_time"] = df["close_time"].apply(to_datetime_utc)
     for c in ["open","high","low","close","volume"]:
-        df[c] = df[c].astype(float)
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df.dropna(subset=["open","high","low","close"], inplace=True)
     return df[["open_time","open","high","low","close","volume","close_time"]]
 
 @st.cache_data(ttl=60*30, show_spinner=False)
@@ -114,8 +116,8 @@ def _coingecko_ohlc(symbol: str, interval: str) -> pd.DataFrame:
     r.raise_for_status()
     arr = r.json()  # [[ts,o,h,l,c],...]
     if not arr:
-        raise RuntimeError("CoinGecko вернул пусто")
-    df = pd.DataFrame(arr, columns=["ts", "open", "high", "low", "close"])
+        raise RuntimeError("CoinGecko пусто")
+    df = pd.DataFrame(arr, columns=["ts","open","high","low","close"])
     df["open_time"] = df["ts"].apply(lambda x: datetime.fromtimestamp(x/1000, tz=timezone.utc))
     df["close_time"] = df["open_time"]
     df["volume"] = 0.0
@@ -126,7 +128,7 @@ def get_klines(symbol: str, interval: str, limit: int) -> pd.DataFrame:
         try:
             return _binance_primary(symbol, interval, limit)
         except Exception:
-            time.sleep(0.6 + attempt*0.8)
+            time.sleep(0.7 + attempt*0.8)
     try:
         return _binance_mirror(symbol, interval, limit)
     except Exception:
@@ -135,7 +137,7 @@ def get_klines(symbol: str, interval: str, limit: int) -> pd.DataFrame:
         df = _coingecko_ohlc(symbol, interval)
         return df.tail(limit).reset_index(drop=True)
     except Exception as e:
-        st.error(f"Не удалось получить котировки {symbol} ({interval}): {e}")
+        st.error(f"Не удалось получить {symbol} ({interval}): {e}")
         return pd.DataFrame(columns=["open_time","open","high","low","close","volume","close_time"])
 
 # Fear & Greed
@@ -147,7 +149,8 @@ def get_fear_greed_df(limit_days: int = 180) -> pd.DataFrame:
         raw = r.json()["data"]
         df = pd.DataFrame(raw)
         df["timestamp"] = df["timestamp"].astype(int).apply(to_datetime_utc)
-        df["value"] = df["value"].astype(int)
+        df["value"] = pd.to_numeric(df["value"], errors="coerce").astype("Int64")
+        df.dropna(subset=["value"], inplace=True)
         return df.sort_values("timestamp").reset_index(drop=True)
     except Exception as e:
         st.warning(f"Fear & Greed недоступен: {e}")
@@ -157,15 +160,14 @@ def get_fear_greed_df(limit_days: int = 180) -> pd.DataFrame:
 def _render_fear_greed_modal():
     fg_df = get_fear_greed_df(170)
 
+    st.markdown(PAGE_CSS, unsafe_allow_html=True)
     st.markdown('<div class="overlay"><div class="modal">', unsafe_allow_html=True)
-    st.markdown(
-        '<div class="modal-header"><h3 style="margin:0">Индекс страха и жадности</h3>'
-        '<form method="post"><button class="btn-close" name="close_fg">Закрыть</button></form></div>',
-        unsafe_allow_html=True
-    )
+    st.markdown('<h3>Индекс страха и жадности</h3>', unsafe_allow_html=True)
 
     if fg_df.empty:
         st.info("Нет данных Fear & Greed. Попробуй позже.")
+        if st.button("Закрыть"):
+            st.session_state["fg_open"] = False
         st.markdown('</div></div>', unsafe_allow_html=True)
         return
 
@@ -192,18 +194,20 @@ def _render_fear_greed_modal():
     sub.update_layout(
         height=720, template="plotly_dark" if DARK else "plotly_white",
         margin=dict(l=10, r=10, t=35, b=10),
-        title_text="Индекс страха и жадности BTC · сравнение с ценой BTC",
+        title_text="Fear & Greed vs BTC price",
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0)
     )
     sub.update_yaxes(range=[0, 100], row=1, col=1, title_text="F&G")
     sub.update_yaxes(title_text="Цена BTC ($)", row=2, col=1)
 
     st.plotly_chart(sub, use_container_width=True, theme=None)
+    if st.button("Закрыть"):
+        st.session_state["fg_open"] = False
     st.markdown('</div></div>', unsafe_allow_html=True)
 
 # ============================ PUBLIC ENTRY ============================
-def tab_entry():
-    """Главная вкладка «Расчёт входа». Убраны «Новости» и «ИИ подсказка». Есть всплывающий график F&G."""
+def tab_entry(*_args, **_kwargs):
+    """Главная вкладка «Расчёт входа». Совместима с вызовом tab_entry(journal)."""
     st.markdown(PAGE_CSS, unsafe_allow_html=True)
 
     st.title("Вкладка 1 — Расчёт входа")
@@ -214,51 +218,64 @@ def tab_entry():
 
     c1, c2, c3 = st.columns([2, 1.2, 1.6])
     with c1:
-        symbol = st.radio("Монета", coins, horizontal=True, index=0)
+        symbol = st.radio("Монета", coins, horizontal=True, index=0, key="symbol_radio")
     with c2:
-        tf_label = st.radio("ТФ", list(tf_map.keys()), horizontal=True, index=1)
+        tf_label = st.radio("ТФ", list(tf_map.keys()), horizontal=True, index=1, key="tf_radio")
         interval = tf_map[tf_label]
     with c3:
-        setup = st.radio("Сетап", ["Пробой", "Откат к EMA21"], horizontal=True, index=0)
+        setup = st.radio("Сетап", ["Пробой", "Откат к EMA21"], horizontal=True, index=0, key="setup_radio")
 
     # Кнопка модалки
-    top = st.columns([1, 1, 2.2])
-    with top[0]:
-        if st.button("Индекс страха и жадности"):
-            st.session_state["fg_open"] = True
+    if st.button("Индекс страха и жадности", key="btn_fng"):
+        st.session_state["fg_open"] = True
 
     # --- Data ---
     limit = 500 if interval == "4h" else 400
     df = get_klines(symbol, interval, limit)
-    if df.empty:
-        st.stop()
+    if df.empty or len(df) < 2:
+        st.warning("Недостаточно данных для расчёта.")
+        if st.session_state.get("fg_open"):
+            _render_fear_greed_modal()
+        return
 
     df["ema21"] = ema(df["close"], 21)
     df["ema50"] = ema(df["close"], 50)
     df["ema100"] = ema(df["close"], 100)
-    df["atr14"] = atr(df, 14)
+    df["atr14"] = atr(df, 14).fillna(method="bfill").fillna(method="ffill")
 
     last = df.iloc[-1]
+    prev = df.iloc[-2]
 
-    if setup == "Откат к EMA21":
-        entry = float(last["ema21"])
-        direction = "long" if last["close"] >= last["ema21"] else "short"
-    else:
-        prev = df.iloc[-2]
-        direction = "long" if last["close"] >= last["ema21"] else "short"
-        entry = float(prev["high"] if direction == "long" else prev["low"])
+    try:
+        if setup == "Откат к EMA21":
+            entry = float(last["ema21"])
+            direction = "long" if last["close"] >= last["ema21"] else "short"
+        else:
+            direction = "long" if last["close"] >= last["ema21"] else "short"
+            entry = float(prev["high"] if direction == "long" else prev["low"])
 
-    risk_choice = st.radio("Выбери риск", ["Низкий (0.5–1%)", "Средний (1–2%)", "Высокий (2–3%)"], horizontal=True, index=0)
-    atr_mult = 1.2 if "Низкий" in risk_choice else (1.6 if "Средний" in risk_choice else 2.0)
+        atr_mult = 1.2
+        risk_choice = st.radio("Выбери риск", ["Низкий (0.5–1%)", "Средний (1–2%)", "Высокий (2–3%)"],
+                               horizontal=True, index=0, key="risk_radio")
+        if "Средний" in risk_choice:
+            atr_mult = 1.6
+        elif "Высокий" in risk_choice:
+            atr_mult = 2.0
 
-    if direction == "long":
-        stop = entry - atr_mult * float(last["atr14"])
-    else:
-        stop = entry + atr_mult * float(last["atr14"])
+        if direction == "long":
+            stop = entry - atr_mult * float(last["atr14"])
+        else:
+            stop = entry + atr_mult * float(last["atr14"])
 
-    tps = rr_targets(entry, stop, (1.0, 1.5, 2.0))
+        tps = rr_targets(entry, stop, direction, (1.0, 1.5, 2.0))
+    except Exception as e:
+        st.error(f"Ошибка расчёта уровней: {e}")
+        if st.session_state.get("fg_open"):
+            _render_fear_greed_modal()
+        return
 
-    st.caption(f"ATR14: {last['atr14']:.2f} | EMA21/50/100: {last['ema21']:.2f}/{last['ema50']:.2f}/{last['ema100']:.2f}")
+    st.caption(f"ATR14: {float(last['atr14']):.2f} | EMA21/50/100: "
+               f"{float(last['ema21']):.2f}/{float(last['ema50']):.2f}/{float(last['ema100']):.2f}")
 
     # --- Chart ---
     fig = make_subplots(rows=1, cols=1, shared_xaxes=True)
@@ -269,9 +286,9 @@ def tab_entry():
     fig.add_trace(go.Scatter(x=df["open_time"], y=df["ema50"], name="EMA50", line=dict(width=1.0, dash="dot")))
     fig.add_trace(go.Scatter(x=df["open_time"], y=df["ema100"], name="EMA100", line=dict(width=1.0, dash="dot")))
 
-    color_levels(fig, [entry], [f"Entry {entry:,.2f}"], "#0bd37d", dash="solid")
-    color_levels(fig, [stop], [f"Stop {stop:,.2f}"], "#ff5252", dash="solid")
-    color_levels(fig, tps, [f"TP{i+1} {v:,.2f}" for i, v in enumerate(tps)], "#9be22a", dash="dash")
+    add_levels(fig, [entry], [f"Entry {entry:,.2f}"], "#0bd37d", dash="solid")
+    add_levels(fig, [stop], [f"Stop {stop:,.2f}"], "#ff5252", dash="solid")
+    add_levels(fig, tps, [f"TP{i+1} {v:,.2f}" for i, v in enumerate(tps)], "#9be22a", dash="dash")
 
     fig.update_layout(
         height=520, margin=dict(l=20, r=20, t=30, b=20),
@@ -281,11 +298,11 @@ def tab_entry():
     )
     st.plotly_chart(fig, use_container_width=True, theme=None)
 
-    rr_abs = abs(entry - stop)
-    rr_ratio = (
-        max((tps[0] - entry) / rr_abs, 0.01) if direction == "long"
-        else max((entry - tps[0]) / rr_abs, 0.01)
-    )
+    rr_abs = abs(entry - stop) or 1e-6
+    if direction == "long":
+        rr_ratio = (tps[0] - entry) / rr_abs
+    else:
+        rr_ratio = (entry - tps[0]) / rr_abs
     st.markdown(
         f"**Предложенный риск-контекст:** `RR≈{rr_ratio:.2f}R`, направление: **{direction}**  \n"
         f"<span class='caption-note'>Уровни рассчитаны из сетапа «{setup}» и ATR×{atr_mult:.1f}.</span>",
