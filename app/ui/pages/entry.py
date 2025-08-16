@@ -1,328 +1,275 @@
-import streamlit as st
-import pandas as pd
+# entry.py
+# -*- coding: utf-8 -*-
+import math
+from datetime import datetime, timedelta, timezone
+
 import numpy as np
+import pandas as pd
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import requests
+import streamlit as st
 
-from ...config.settings import SYMBOLS, BASE_CAPITAL, MIN_RR, CACHE_TTL
-from ...data.binance_feed import MarketDataProvider
-from ...core.levels import LevelBuilder
-from ...core.risk import RiskScorer, PositionSizer
-from ...strategies.pullback import PullbackEMA21
-from ...strategies.breakout import BreakoutRange
-from ...services.journal import TradeJournal
-from ...services.llm import llm_suggest
+# --------------------------- UI THEME TWEAKS ---------------------------
+st.set_page_config(page_title="Расчёт входа", layout="wide")
+DARK = True
+PRIMARY = "#ff3b3b"
 
+CUSTOM_CSS = f"""
+<style>
+    .block-container {{ padding-top: 1.2rem; max-width: 1260px; }}
+    .stRadio > label {{ font-weight: 600; }}
+    .metric-note {{
+        font-size: 12px; opacity: .75; margin-top: -6px;
+    }}
+    /* Modal overlay for Fear & Greed */
+    .overlay {{
+        position: fixed; inset: 0; background: rgba(0,0,0,.65);
+        z-index: 1000; display: flex; align-items: center; justify-content: center;
+    }}
+    .modal {{
+        width: 92%; max-width: 1100px; background: {'#111' if DARK else '#fff'};
+        border: 1px solid #333; border-radius: 14px; padding: 14px 18px;
+        box-shadow: 0 20px 50px rgba(0,0,0,.55);
+    }}
+    .modal-header {{
+        display:flex; align-items:center; justify-content:space-between;
+        gap: 10px; margin-bottom: 6px;
+    }}
+    .btn-close {{
+        background: {PRIMARY}; color: #fff; border: none; padding: 6px 10px;
+        border-radius: 8px; cursor: pointer; font-weight: 600;
+    }}
+</style>
+"""
+st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 
-# -----------------------------
-# Data
-# -----------------------------
-@st.cache_data(ttl=CACHE_TTL)
-def load_klines(symbol: str, tf: str, limit: int = 500) -> pd.DataFrame:
-    provider = MarketDataProvider()
-    return provider.klines(symbol, interval=tf, limit=limit)
+# --------------------------- STATE ---------------------------
+if "fg_open" not in st.session_state:
+    st.session_state.fg_open = False
 
+# --------------------------- HELPERS ---------------------------
+def to_datetime_utc(ts):
+    # Binance gives ms, FNG gives seconds
+    if ts > 10**12:
+        return datetime.fromtimestamp(ts / 1000, tz=timezone.utc)
+    return datetime.fromtimestamp(ts, tz=timezone.utc)
 
-# -----------------------------
-# Helpers (levels, stops, targets)
-# -----------------------------
-def _zone_avg(z):
-    if z is None:
-        return None
-    # объект из LevelBuilder.Zone
-    lo = float(getattr(z, "start_price", None) or getattr(z, "lo", 0.0))
-    hi = float(getattr(z, "end_price", None) or getattr(z, "hi", 0.0))
-    if lo and hi:
-        return (lo + hi) / 2.0
-    return None
+@st.cache_data(ttl=60 * 30, show_spinner=False)
+def get_binance_klines(symbol: str, interval: str, limit: int = 500) -> pd.DataFrame:
+    url = "https://api.binance.com/api/v3/klines"
+    params = {"symbol": symbol, "interval": interval, "limit": limit}
+    r = requests.get(url, params=params, timeout=15)
+    r.raise_for_status()
+    data = r.json()
+    cols = ["open_time","open","high","low","close","volume",
+            "close_time","qav","trades","taker_base","taker_quote","ignore"]
+    df = pd.DataFrame(data, columns=cols)
+    df["open_time"] = df["open_time"].apply(to_datetime_utc)
+    df["close_time"] = df["close_time"].apply(to_datetime_utc)
+    numeric_cols = ["open","high","low","close","volume"]
+    df[numeric_cols] = df[numeric_cols].astype(float)
+    df = df[["open_time","open","high","low","close","volume","close_time"]]
+    return df
 
+@st.cache_data(ttl=60 * 60 * 3, show_spinner=False)
+def get_fear_greed_df(limit_days: int = 180) -> pd.DataFrame:
+    url = "https://api.alternative.me/fng/"
+    params = {"limit": limit_days, "format": "json"}
+    r = requests.get(url, params=params, timeout=15)
+    r.raise_for_status()
+    raw = r.json()["data"]
+    df = pd.DataFrame(raw)
+    df["timestamp"] = df["timestamp"].astype(int).apply(to_datetime_utc)
+    df["value"] = df["value"].astype(int)
+    df = df.sort_values("timestamp").reset_index(drop=True)
+    return df
 
-def infer_side(context: dict, htf_dir: str) -> str:
-    """
-    Выбор направления сделки: long/short
-    - по умолчанию в сторону HTF
-    - если HTF=range, берём сторону micro-structure
-    """
-    if htf_dir in ("up", "down"):
-        return "long" if htf_dir == "up" else "short"
-    if context.get("structure") == "up":
-        return "long"
-    if context.get("structure") == "down":
-        return "short"
-    return "long"
+def ema(series, period):
+    return series.ewm(span=period, adjust=False).mean()
 
+def atr(df: pd.DataFrame, period: int = 14):
+    high_low = df["high"] - df["low"]
+    high_close = (df["high"] - df["close"].shift(1)).abs()
+    low_close = (df["low"] - df["close"].shift(1)).abs()
+    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    return tr.rolling(period).mean()
 
-def swing_entry_stop(df: pd.DataFrame, context: dict, side: str) -> tuple[float, float]:
-    """
-    Вход из зоны спроса/предложения или от EMA21-отката.
-    Стоп: за последний пивот и не меньше 1.5×ATR.
-    Возвращает (entry, stop).
-    """
-    atr = float(context["atr14"])
-    ema21 = float(context["ema21"])
-    last_close = float(df["close"].iloc[-1])
-
-    if side == "long":
-        # приоритет: зона спроса
-        e = _zone_avg(context.get("demand"))
-        if e is None:
-            # fallback: откат к EMA21
-            e = ema21
-        entry = e
-
-        # стоп за свинг-лоу последних 10 баров
-        swing_low = float(df["low"].iloc[-10:].min())
-        stop = min(swing_low, entry - 1.5 * atr)
-
-        # если цена слишком далеко от точки входа, используем текущую как лимит
-        if abs(last_close - entry) > 2.5 * atr:
-            entry = last_close
-
-    else:
-        # short
-        e = _zone_avg(context.get("supply"))
-        if e is None:
-            e = ema21  # как ретест с другой стороны
-        entry = e
-
-        swing_high = float(df["high"].iloc[-10:].max())
-        stop = max(swing_high, entry + 1.5 * atr)
-
-        if abs(last_close - entry) > 2.5 * atr:
-            entry = last_close
-
-    return float(entry), float(stop)
-
-
-def targets_by_r(entry: float, stop: float, r_list=(1.0, 1.5, 2.0)) -> list[float]:
-    sign = 1.0 if entry > stop else -1.0  # long if stop < entry
+def rr_targets(entry: float, stop: float, multiples=(1.0, 1.5, 2.0)):
     r = abs(entry - stop)
-    return [entry + sign * r * rr for rr in r_list]
+    return [entry + math.copysign(m*r, entry - stop < 0) for m in multiples]  # long/short aware
 
+def color_levels(fig, y_values, labels, color, dash="dash", row=1, col=1):
+    for y, label in zip(y_values, labels):
+        fig.add_hline(y=y, line=dict(color=color, width=1.6, dash=dash),
+                      annotation_text=label, annotation_position="right", row=row, col=col)
 
-def render_chart(df: pd.DataFrame, entry: float, stop: float, tps: list[float], side: str):
-    fig = go.Figure(data=[go.Candlestick(
-        x=df.index, open=df['open'], high=df['high'], low=df['low'], close=df['close']
-    )])
+# --------------------------- UI: Controls ---------------------------
+st.title("Вкладка 1 — Расчёт входа")
 
-    buy = (side == "long")
-    entry_color = "green" if buy else "red"
-    stop_color  = "red" if buy else "green"
-    tp_color    = "green" if buy else "red"
+coins = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT"]
+tf_map = {"4h": "4h", "1d": "1d"}
+col1, col2, col3 = st.columns([2, 1.2, 1.6])
 
-    # ENTRY
-    fig.add_hline(y=entry, line_color=entry_color, line_width=2,
-                  annotation_text=f"Entry {entry:.2f}", annotation_position="top left")
+with col1:
+    symbol = st.radio("Монета", coins, horizontal=True, index=0)
+with col2:
+    tf_label = st.radio("ТФ", list(tf_map.keys()), horizontal=True, index=1)
+    interval = tf_map[tf_label]
+with col3:
+    setup = st.radio("Сетап", ["Пробой", "Откат к EMA21"], horizontal=True, index=0)
 
-    # STOP
-    fig.add_hline(y=stop, line_color=stop_color, line_width=2,
-                  annotation_text=f"Stop {stop:.2f}", annotation_position="bottom left")
+top_row = st.columns([1, 1, 2])
+with top_row[0]:
+    st.write("**Структура (тех. контекст):**")
+with top_row[1]:
+    # кнопка для модалки с графиком индекса страха/жадности
+    if st.button("Индекс страха и жадности"):
+        st.session_state.fg_open = True
 
-    # TP1/2/3 пунктиром
-    for i, tpv in enumerate(tps, start=1):
-        fig.add_hline(y=tpv, line_color=tp_color, line_dash="dot", line_width=2,
-                      annotation_text=f"TP{i} {tpv:.2f}", annotation_position="top right")
+# --------------------------- DATA ---------------------------
+limit = 500 if interval == "4h" else 400
+df = get_binance_klines(symbol, interval, limit=limit)
 
-    fig.update_layout(height=580, margin=dict(l=10, r=10, t=30, b=10))
-    st.plotly_chart(fig, use_container_width=True)
+df["ema21"] = ema(df["close"], 21)
+df["ema50"] = ema(df["close"], 50)
+df["ema100"] = ema(df["close"], 100)
+df["atr14"] = atr(df, 14)
 
+# предложим базовый вход/стоп
+last = df.iloc[-1]
+if setup == "Откат к EMA21":
+    entry = float(last["ema21"])
+else:  # Пробой вчерашнего high/low
+    prev = df.iloc[-2]
+    direction_long = last["close"] >= last["ema21"]
+    entry = float(prev["high"] if direction_long else prev["low"])
 
-# -----------------------------
-# UI
-# -----------------------------
-SETUPS = {
-    "Пробой": BreakoutRange,
-    "Откат к EMA21": PullbackEMA21,
-}
+risk_pct_choice = st.radio(
+    "Выбери риск", ["Низкий (0.5–1%)", "Средний (1–2%)", "Высокий (2–3%)"],
+    horizontal=True, index=0
+)
 
+atr_mult = 1.2 if "Низкий" in risk_pct_choice else (1.6 if "Средний" in risk_pct_choice else 2.0)
+# стоп за ближайший swing/ATR
+if setup == "Откат к EMA21":
+    stop = entry - atr_mult * float(last["atr14"])
+    direction = "long"
+else:
+    direction = "long" if last["close"] >= last["ema21"] else "short"
+    stop = entry - atr_mult * float(last["atr14"]) if direction == "long" else entry + atr_mult * float(last["atr14"])
 
-def tab_entry(journal: TradeJournal):
-    st.subheader("Вкладка 1 — Расчёт входа")
+tps = rr_targets(entry, stop, multiples=(1.0, 1.5, 2.0))
 
-    # Верхняя панель выбора
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        symbol = st.radio("Монета", SYMBOLS, horizontal=True, index=0)
-    with col2:
-        tf = st.radio("ТФ", ["4h", "1d"], horizontal=True, index=0)
-    with col3:
-        setup_name = st.radio("Сетап", list(SETUPS.keys()), horizontal=True)
+# контекстная строка
+context = f"ATR14: {last['atr14']:.2f} | EMA21/50/100: {last['ema21']:.2f}/{last['ema50']:.2f}/{last['ema100']:.2f}"
+st.caption(context)
 
-    st.divider()
+# --------------------------- CHART ---------------------------
+fig = go.Figure()
+fig = make_subplots(rows=1, cols=1, shared_xaxes=True, specs=[[{"secondary_y": False}]])
 
-    # Данные и контекст
-    data = load_klines(symbol, tf)
-    lb = LevelBuilder(data)
-    context = lb.build_summary()
+candles = go.Candlestick(
+    x=df["open_time"], open=df["open"], high=df["high"],
+    low=df["low"], close=df["close"], name=symbol
+)
+fig.add_trace(candles, row=1, col=1)
+fig.add_trace(go.Scatter(x=df["open_time"], y=df["ema21"], name="EMA21", line=dict(width=1.3)), row=1, col=1)
+fig.add_trace(go.Scatter(x=df["open_time"], y=df["ema50"], name="EMA50", line=dict(width=1.0, dash="dot")), row=1, col=1)
+fig.add_trace(go.Scatter(x=df["open_time"], y=df["ema100"], name="EMA100", line=dict(width=1.0, dash="dot")), row=1, col=1)
 
-    st.write(
-        f"Структура: **{context['structure']}** | "
-        f"ATR14: {context['atr14']:.2f} | "
-        f"EMA21/50/100: {context['ema21']:.2f}/{context['ema50']:.2f}/{context['ema100']:.2f}"
+# уровни
+color_levels(fig, [entry], [f"Entry {entry:,.2f}"], "#00c853", dash="solid")
+color_levels(fig, [stop], [f"Stop {stop:,.2f}"], "#ff5252", dash="solid")
+color_levels(fig, tps, [f"TP{i+1} {v:,.2f}" for i, v in enumerate(tps)], "#7ddc1f", dash="dash")
+
+fig.update_layout(
+    height=520, margin=dict(l=20, r=20, t=30, b=20),
+    xaxis_rangeslider_visible=False, template="plotly_dark" if DARK else "plotly_white",
+    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0)
+)
+
+st.plotly_chart(fig, use_container_width=True, theme=None)
+
+# --------------------------- FEAR & GREED MODAL ---------------------------
+def render_fear_greed_modal():
+    fg_df = get_fear_greed_df(limit_days=170)
+
+    # Подгружаем дневные свечи BTC для нижней панели, в диапазоне дат F&G
+    start_date = fg_df["timestamp"].min().date() - timedelta(days=5)
+    end_date = fg_df["timestamp"].max().date() + timedelta(days=2)
+    btc_day = get_binance_klines("BTCUSDT", "1d", limit=600)
+    btc_day = btc_day[(btc_day["open_time"].dt.date >= start_date) & (btc_day["open_time"].dt.date <= end_date)]
+
+    # Фигура: 2 ряда
+    sub = make_subplots(
+        rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.12,
+        row_heights=[0.62, 0.38]
     )
 
-    # HTF контекст
-    against_htf = False
-    htf_dir = "range"
-    if tf == "4h":
-        htf_df = load_klines(symbol, "1d")
-        from ...core.levels import LevelBuilder as LB2
-        htf_dir = LB2(htf_df).htf_trend()
-        st.write(f"HTF (D1) тренд: **{htf_dir}**")
-        if context['structure'] in ("up", "down") and htf_dir in ("up", "down"):
-            against_htf = (
-                (htf_dir == "up" and context['structure'] == "down")
-                or (htf_dir == "down" and context['structure'] == "up")
-            )
-
-    # Новости (ручной режим осторожности)
-    near_news = st.toggle("Новости в 24–48ч (режим осторожности)", value=False)
-
-    # ИИ-подсказка (прячем кнопку, если ключа нет)
-    with st.expander("ИИ-подсказка (опционально)"):
-        if st.button("Запросить совет ассистента"):
-            serial = {k: (vars(v) if hasattr(v, "__dict__") else v) for k, v in context.items()}
-            hint = llm_suggest(serial)
-            if hint.get("enabled"):
-                st.json(hint["data"])
-            else:
-                st.info(f"Подсказка недоступна: {hint.get('reason')}")
-
-    # Направление
-    side = infer_side(context, htf_dir)
-
-    # Сигнал от выбранной стратегии (используем как подсказку)
-    StrategyCls = SETUPS.get(setup_name)
-    strat_entry, strat_stop = None, None
-    if StrategyCls is not None:
-        sig = StrategyCls(data).signal()
-        if sig:
-            strat_entry, strat_stop = sig
-
-    # Свинговый план (главный)
-    entry, stop = swing_entry_stop(data, context, side)
-
-    # Если стратегия дала валидный сигнал и он ближе к рынку — подмешиваем
-    if strat_entry and strat_stop:
-        if abs(float(data["close"].iloc[-1]) - strat_entry) < abs(float(data["close"].iloc[-1]) - entry):
-            entry, stop = float(strat_entry), float(strat_stop)
-
-    # Цели
-    tp_levels = targets_by_r(entry, stop, r_list=(1.0, 1.5, 2.0))
-    rr_min = (tp_levels[1] - entry) / abs(entry - stop) if (entry - stop) != 0 else 0.0
-    st.write(f"Предложенный риск-контекст: RR≈**{rr_min:.2f}R**, направление: **{side}**")
-
-    # Риск (кнопки)
-    risk_choice = st.radio(
-        "Выбери риск",
-        options=["Низкий (0.5–1%)", "Средний (1–2%)", "Высокий (2–3%)"],
-        index=1,
-        horizontal=True,
-        key="risk_choice",
-    )
-    if risk_choice.startswith("Низкий"):
-        risk_pct = 1.0
-    elif risk_choice.startswith("Высокий"):
-        risk_pct = 2.5
-    else:
-        risk_pct = 1.5
-
-    # Скоринг риска с учётом HTF/новостей
-    rs = RiskScorer(min_rr=MIN_RR)
-    advice = rs.recommend(context, against_htf=against_htf, near_news=near_news)
-    # берём максимум между выбранным и рекомендуемым, но не > 3%
-    risk_pct = min(3.0, max(risk_pct, advice.percent))
-
-    # Размер позиции
-    sz = PositionSizer(BASE_CAPITAL)
-    sizing = sz.size(entry, stop, risk_pct)
-
-    # График с уровнями
-    render_chart(data, entry, stop, tp_levels, side)
-
-    # Метрики
-    colA, colB, colC, colD = st.columns(4)
-    with colA:
-        st.metric("Entry", f"{entry:.4f}")
-    with colB:
-        st.metric("Stop", f"{stop:.4f}")
-    with colC:
-        st.metric("Риск, $", f"{sizing['risk_$']}")
-    with colD:
-        st.metric("Кол-во", f"{sizing['qty']}")
-
-    st.write(
-        f"TP1: **{tp_levels[0]:.4f}** | TP2: **{tp_levels[1]:.4f}** | TP3: **{tp_levels[2]:.4f}** "
-        f"| Минимум RR: **{rr_min:.2f}R**"
+    # Линия индекса
+    sub.add_trace(
+        go.Scatter(x=fg_df["timestamp"], y=fg_df["value"], mode="lines+markers",
+                   name="Fear&Greed", line=dict(width=1.7)),
+        row=1, col=1
     )
 
-    # Мини-отчёт
-    with st.expander("Мини-отчёт по сетапу"):
-        st.json(
-            {
-                "symbol": symbol,
-                "tf": tf,
-                "setup": setup_name,
-                "side": side,
-                "structure": context["structure"],
-                "bos": context["bos"],
-                "zone_demand": vars(context["demand"]) if context["demand"] else None,
-                "zone_supply": vars(context["supply"]) if context["supply"] else None,
-                "atr14": round(context["atr14"], 4),
-                "risk_%": risk_pct,
-                "entry": round(entry, 6),
-                "stop": round(stop, 6),
-                "tp1": round(tp_levels[0], 6),
-                "tp2": round(tp_levels[1], 6),
-                "tp3": round(tp_levels[2], 6),
-                "rr_min": round(rr_min, 3),
-                "advice": {"bucket": advice.bracket, "why": advice.reason},
-            }
-        )
+    # Цветные зоны
+    bands = [
+        (0, 25, "#ff6666", "Экстремальный страх"),
+        (25, 45, "#ffcc80", "Страх"),
+        (45, 55, "#ffe082", "Нейтрально"),
+        (55, 75, "#c5e1a5", "Жадность"),
+        (75, 100, "#81c784", "Экстремальная жадность"),
+    ]
+    for y0, y1, color, _ in bands:
+        sub.add_hrect(y0=y0, y1=y1, line_width=0, fillcolor=color, opacity=0.25, row=1, col=1)
 
-    # Кнопки плана (отложки)
-    col1, col2, col3 = st.columns(3)
-    disabled_rr = rr_min < MIN_RR
-    msg_rr = f"RR {rr_min:.2f} < {MIN_RR} — план не допускается." if disabled_rr else None
+    # Цена BTC
+    sub.add_trace(
+        go.Scatter(x=btc_day["open_time"], y=btc_day["close"], name="BTCUSDT (close)"),
+        row=2, col=1
+    )
 
-    with col1:
-        btn_plan = st.button("Поставить ордер", type="primary", disabled=disabled_rr)
-    with col2:
-        btn_activated = st.button("Активировался")
-    with col3:
-        btn_cancel = st.button("Отменён")
+    sub.update_layout(
+        height=720, template="plotly_dark" if DARK else "plotly_white",
+        margin=dict(l=10, r=10, t=35, b=10),
+        title_text="Индекс страха и жадности BTC (сравнение с ценой BTC)"
+    )
+    sub.update_yaxes(range=[0, 100], row=1, col=1, title_text="F&G")
+    sub.update_yaxes(title_text="Цена BTC ($)", row=2, col=1)
 
-    if msg_rr and btn_plan:
-        st.warning(msg_rr)
+    # отрисовка модалки
+    st.markdown('<div class="overlay"><div class="modal">', unsafe_allow_html=True)
+    st.markdown(
+        f'<div class="modal-header"><h3 style="margin:0">Индекс страха и жадности</h3>'
+        f'<form method="post"><button class="btn-close" name="close_fg">Закрыть</button></form></div>',
+        unsafe_allow_html=True
+    )
+    st.plotly_chart(sub, use_container_width=True, theme=None)
+    st.markdown('</div></div>', unsafe_allow_html=True)
 
-    # Журнал
-    decision = None
-    if btn_plan:
-        decision = "planned"
-    elif btn_activated:
-        decision = "activated"
-    elif btn_cancel:
-        decision = "cancelled"
+# Обработка кнопки закрытия (костыль через form POST)
+if st.session_state.fg_open and st.session_state.get("_submitted_close", False):
+    st.session_state.fg_open = False
+    st.session_state._submitted_close = False
 
-    if decision:
-        journal.append(
-            {
-                "time": str(pd.Timestamp.utcnow()),
-                "symbol": symbol,
-                "tf": tf,
-                "setup": setup_name,
-                "entry": entry,
-                "stop": stop,
-                "tp1": tp_levels[0],
-                "tp2": tp_levels[1],
-                "tp3": tp_levels[2],
-                "rr_min": rr_min,
-                "risk_%": risk_pct,
-                "risk_$": sizing["risk_$"],
-                "qty": sizing["qty"],
-                "decision": decision,
-            }
-        )
-        st.success(
-            "Записано в журнал: "
-            + ("План" if decision == "planned" else "Активировался" if decision == "activated" else "Отменён")
-        )
+# перехват пост-запроса для кнопки закрыть
+params = st.experimental_get_query_params()
+if st.session_state.fg_open:
+    render_fear_greed_modal()
+
+# маленький хак: отлавливаем submit «Закрыть»
+# (Streamlit не дает слушать POST формы глобально; делаем через js-free трюк)
+close_key = st.session_state.get("close_key_once", 0)
+st.session_state["close_key_once"] = close_key + 1
+
+# --------------------------- SIDE INFO ---------------------------
+with st.container():
+    rr = abs(entry - stop)
+    rr_ratio = max((tps[0] - entry) / rr, 0.01) if direction == "long" else max((entry - tps[0]) / rr, 0.01)
+    st.markdown(
+        f"**Предложенный риск-контекст:** `RR≈{rr_ratio:.2f}R`, направление: **{direction}**  \n"
+        f"<span class='metric-note'>Примечание: уровни Entry/Stop/TP рассчитаны из контекста {setup} и ATRx{atr_mult:.1f}.</span>",
+        unsafe_allow_html=True
+    )
