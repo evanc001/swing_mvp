@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual env
+.venv/
+env/
+
+# Streamlit secrets & runtime
+.streamlit/secrets.toml
+.streamlit/**/secrets.toml
+.streamlit/**/credentials.toml
+.streamlit/credentials.toml
+
+# App artifacts
+journal.csv
+
+# OS
+.DS_Store
