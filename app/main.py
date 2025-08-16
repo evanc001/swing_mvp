@@ -1,3 +1,11 @@
+# app/main.py
+import sys
+from pathlib import Path
+
+# Добавляем родительский каталог в sys.path, чтобы работали импорты вида from app.*
+ROOT = Path(__file__).resolve().parent
+sys.path.append(str(ROOT.parent))
+
 import streamlit as st
 from app.ui.pages.entry import tab_entry
 from app.ui.pages.reporting import tab_reporting
